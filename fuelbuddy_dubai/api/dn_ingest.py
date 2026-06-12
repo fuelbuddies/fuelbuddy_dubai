@@ -10,8 +10,14 @@
 # This module exposes a whitelisted endpoint that simply ENQUEUES the insert
 # onto an RQ background queue and returns immediately, so the gunicorn worker is
 # freed in milliseconds. The background job performs the insert (draft,
-# docstatus 0) and writes the resulting DN name + sync status back to Hasura
-# itself (invoiced_item.delivery_note_erp_code / erp_sync_status).
+# docstatus 0) and then NOTIFIES erp-functions of the outcome.
+#
+# ERPNext does NOT talk to Hasura. Completing the invoiced_item status
+# (delivery_note_erp_code + erp_sync_status) is owned by the Node side:
+# the job POSTs {invoiced_item_id, delivery_note_erp_code, status} to the
+# erp-functions webhook (invoicedItem.controller.js), which writes it to Hasura.
+# So the Hasura admin secret never lives on the ERPNext box — ERPNext holds only
+# the erp-functions URL + a shared callback secret.
 #
 # Submission (draft -> docstatus 1) is NOT done here — it stays out-of-band via
 # the serialized, cascade-skipping drain. "Synced to ERP" == "draft created".
@@ -21,8 +27,8 @@
 # the RQ workers pick up the new code, and set the two site-config keys below.
 #
 # Required site config (site_config.json or common_site_config.json):
-#   "hasura_endpoint":     "https://<hasura-host>/v1/graphql"
-#   "hasura_admin_secret": "<x-hasura-admin-secret>"
+#   "erp_functions_base_url": "https://<erp-functions-host>"   # no trailing slash
+#   "erp_functions_secret":   "<shared secret == erp-functions ERP_API_SECRET>"
 # =============================================================================
 
 import json
@@ -97,7 +103,7 @@ def create_delivery_note_draft(dn_payload, invoiced_item_id):
 		existing = _existing_dn(invoiced_item_id)
 		if existing:
 			_run_duplicate_check(invoiced_item_id, existing, dn_payload.get("amended_from"))
-			_sync_hasura(invoiced_item_id, existing, "COMPLETED")
+			_notify_completion(invoiced_item_id, existing, "COMPLETED")
 			return
 
 		doc = frappe.get_doc({"doctype": DOCTYPE, **dn_payload})
@@ -106,7 +112,7 @@ def create_delivery_note_draft(dn_payload, invoiced_item_id):
 		frappe.db.commit()
 
 		_run_duplicate_check(invoiced_item_id, doc.name, dn_payload.get("amended_from"))
-		_sync_hasura(invoiced_item_id, doc.name, "COMPLETED")
+		_notify_completion(invoiced_item_id, doc.name, "COMPLETED")
 
 	except Exception:
 		frappe.db.rollback()
@@ -116,7 +122,7 @@ def create_delivery_note_draft(dn_payload, invoiced_item_id):
 		)
 		# Best-effort: mark the row FAILED so erp-functions' retry/monitoring can
 		# pick it up. Re-raise so RQ records the failure for this job.
-		_sync_hasura(invoiced_item_id, None, "FAILED")
+		_notify_completion(invoiced_item_id, None, "FAILED")
 		raise
 
 
@@ -182,56 +188,50 @@ def _run_duplicate_check(invoiced_item_id, dn_name, amended_from):
 		)
 
 
-def _sync_hasura(invoiced_item_id, dn_code, status):
-	"""Write delivery_note_erp_code + erp_sync_status back to Hasura.
+def _notify_completion(invoiced_item_id, dn_code, status):
+	"""Notify erp-functions of the DN outcome; it owns the Hasura write.
 
-	`status` is one of COMPLETED / FAILED / PENDING (matches the erp-functions
-	ERP_SYNC_STATUS enum). dn_code is set only when known.
+	ERPNext does NOT touch Hasura. We POST the result to the erp-functions
+	invoiced-item webhook (invoicedItem.controller.js), which sets
+	delivery_note_erp_code + erp_sync_status on the row via its own Hasura client.
+
+	`status` is one of COMPLETED / FAILED (matches the erp-functions
+	ERP_SYNC_STATUS enum). dn_code is sent only when known.
 	"""
 	import requests
 
-	endpoint = frappe.conf.get("hasura_endpoint")
-	secret = frappe.conf.get("hasura_admin_secret")
-	if not endpoint or not secret:
+	base = frappe.conf.get("erp_functions_base_url")
+	secret = frappe.conf.get("erp_functions_secret")
+	if not base:
 		frappe.log_error(
-			title="DN Ingest — Hasura creds missing",
-			message="Set hasura_endpoint + hasura_admin_secret in site config. "
+			title="DN Ingest — erp_functions_base_url missing",
+			message="Set erp_functions_base_url (+ erp_functions_secret) in site config. "
 			"invoiced_item={0} dn={1} status={2}".format(invoiced_item_id, dn_code, status),
 		)
 		return
 
-	_set = {"erp_sync_status": status}
+	payload = {"invoiced_item_id": invoiced_item_id, "erp_sync_status": status}
 	if dn_code:
-		_set["delivery_note_erp_code"] = dn_code
+		payload["delivery_note_erp_code"] = dn_code
 
-	query = (
-		"mutation($id: uuid!, $_set: invoiced_item_set_input!) {"
-		"  update_invoiced_item_by_pk(pk_columns: {id: $id}, _set: $_set) {"
-		"    id delivery_note_erp_code erp_sync_status"
-		"  }"
-		"}"
-	)
+	headers = {"Content-Type": "application/json"}
+	if secret:
+		headers["x-erp-api-secret"] = secret
 
 	try:
 		resp = requests.post(
-			endpoint,
-			json={"query": query, "variables": {"id": invoiced_item_id, "_set": _set}},
-			headers={
-				"Content-Type": "application/json",
-				"x-hasura-admin-secret": secret,
-			},
+			"{0}/v1/erp/invoiced-item".format(base.rstrip("/")),
+			json=payload,
+			headers=headers,
 			timeout=30,
 		)
 		resp.raise_for_status()
-		data = resp.json()
-		if data.get("errors"):
-			frappe.log_error(
-				title="DN Ingest — Hasura writeback errors",
-				message="invoiced_item={0}\n{1}".format(invoiced_item_id, json.dumps(data["errors"])),
-			)
 	except Exception:
+		# Best-effort: if the callback fails the DN still exists; the row stays
+		# PENDING and a reconcile/retrigger can complete it. Never fail the job
+		# on the callback (the heavy work — the insert — already succeeded).
 		frappe.log_error(
-			title="DN Ingest — Hasura writeback failed",
+			title="DN Ingest — completion callback failed",
 			message="invoiced_item={0} dn={1} status={2}\n{3}".format(
 				invoiced_item_id, dn_code, status, frappe.get_traceback()
 			),
