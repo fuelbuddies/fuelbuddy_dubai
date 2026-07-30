@@ -34,7 +34,11 @@ import redis
 KEY_PREFIX = "fb_drain:bin:"
 MUT_PREFIX = "fb_drain:bin_mutations:"
 RUN_KEY = "fb_drain:run:active"
-SHADOW_TTL_S = 24 * 60 * 60   # 24h hard ceiling
+SHADOW_TTL_S = 24 * 60 * 60   # 24h hard ceiling (shadow snapshots)
+# A drain job is hard-killed by RQ at 1h, so an active-run key older than 2h is
+# guaranteed stale (SIGKILL mid-job skips cleanup and would otherwise block
+# every drain for a day — observed 30 Jul 2026).
+RUN_KEY_TTL_S = 2 * 60 * 60
 
 
 def _raw_redis() -> redis.Redis:
@@ -68,7 +72,7 @@ def initialize(run_id: str, pairs: list[tuple[str, str]]) -> dict:
         if existing != run_id:
             frappe.throw(f"Another drain is already active: run_id={existing}")
 
-    r.set(RUN_KEY, run_id, ex=SHADOW_TTL_S)
+    r.set(RUN_KEY, run_id, ex=RUN_KEY_TTL_S)
 
     summary = []
     for item, wh in pairs:
