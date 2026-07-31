@@ -45,6 +45,7 @@ Projection for 95k DN drain on prod hardware:
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Optional
 
@@ -66,6 +67,7 @@ def drain(
     dry_run: int = 0,
     item_code: str = HOT_ITEM,
     warehouse: str = HOT_WAREHOUSE,
+    min_age_minutes: int = 0,
 ) -> dict:
     """
     Drain back-dated draft Delivery Notes through the v3.6 fast path.
@@ -78,6 +80,10 @@ def drain(
         dry_run:    1 = pre-flight + simulate only, no commits
         item_code:  the hot item (drain assumes single-item, single-warehouse)
         warehouse:  the hot warehouse
+        min_age_minutes: only pick drafts created at least this many minutes
+                    ago (0 = no age filter); lets the scheduled drain leave
+                    freshly punched DNs alone. Waived when a full batch_size
+                    of backlog exists — throughput wins over the age guard.
 
     Returns:
         dict with stage breakdowns, per-phase timings, shadow reconciliation,
@@ -91,6 +97,7 @@ def drain(
             "customer": customer, "from_date": from_date, "to_date": to_date,
             "batch_size": batch_size, "dry_run": int(dry_run),
             "item_code": item_code, "warehouse": warehouse,
+            "min_age_minutes": int(min_age_minutes),
         },
     }
 
@@ -99,8 +106,14 @@ def drain(
         # 1. Pick drafts
         # ------------------------------------------------------------------
         t = time.time()
+        # Age guard is waived when a full batch of backlog exists: pick oldest-first
+        # ignoring age; only if that comes up short of batch_size (backlog under the
+        # cap) re-pick with the min_age filter so freshly punched DNs are left alone.
         drafts = _pick_drafts(customer, from_date, to_date, batch_size,
                               item_code, warehouse)
+        if int(min_age_minutes) > 0 and int(batch_size) > 0 and len(drafts) < int(batch_size):
+            drafts = _pick_drafts(customer, from_date, to_date, batch_size,
+                                  item_code, warehouse, int(min_age_minutes))
         timings["pick_s"] = round(time.time() - t, 3)
         result["draft_count"] = len(drafts)
         if not drafts:
@@ -312,6 +325,71 @@ def drain(
         return result
 
 
+def _result_key(job_id: str) -> str:
+    return f"fb_dn_drain_result:{job_id}"
+
+
+@frappe.whitelist()
+def drain_async(
+    customer: Optional[str] = None,
+    from_date: str = "2026-04-01",
+    to_date: str = "2026-04-30",
+    batch_size: int = 0,
+    dry_run: int = 0,
+    item_code: str = HOT_ITEM,
+    warehouse: str = HOT_WAREHOUSE,
+    min_age_minutes: int = 0,
+) -> dict:
+    """
+    Enqueue drain() on the long worker and return a job_id to poll via
+    drain_status(). HTTP-safe wrapper: a synchronous drain call can outlive
+    the gateway/gunicorn timeout, which kills it MID-BATCH — DNs submitted
+    with the skip-flags engaged but no consolidated repost, and a stale
+    shadow RUN_KEY that blocks the next drain. RQ jobs have no such timeout.
+    Explicit params (no **kwargs) so Frappe's `cmd` form param never leaks in.
+    """
+    job_id = "fb-dn-drain-" + frappe.generate_hash(length=8)
+    frappe.enqueue(
+        "fuelbuddy_dubai.api.dn_drain._drain_job",
+        queue="long",
+        timeout=3600,
+        job_id=job_id,
+        result_key=_result_key(job_id),
+        drain_kwargs={
+            "customer": customer, "from_date": from_date, "to_date": to_date,
+            "batch_size": batch_size, "dry_run": dry_run,
+            "item_code": item_code, "warehouse": warehouse,
+            "min_age_minutes": min_age_minutes,
+        },
+    )
+    return {"job_id": job_id}
+
+
+def _drain_job(result_key: str, drain_kwargs: dict) -> None:
+    """RQ target: run the drain and stash its result for drain_status()."""
+    result = drain(**drain_kwargs)
+    frappe.cache().set_value(result_key, json.dumps(result, default=str),
+                             expires_in_sec=3600)
+
+
+@frappe.whitelist()
+def drain_status(job_id: str) -> dict:
+    """Poll a drain_async job: done (with result), failed (with traceback tail),
+    or pending."""
+    raw = frappe.cache().get_value(_result_key(job_id))
+    if raw:
+        return {"status": "done", "result": json.loads(raw)}
+    try:
+        from rq.job import Job
+        from frappe.utils.background_jobs import get_redis_conn
+        job = Job.fetch(f"{frappe.local.site}::{job_id}", connection=get_redis_conn())
+        if job.get_status() == "failed":
+            return {"status": "failed", "error": (job.exc_info or "")[-500:]}
+    except Exception:
+        pass  # job not in RQ (yet/anymore) — fall through to pending
+    return {"status": "pending"}
+
+
 def _pick_drafts(
     customer: Optional[str],
     from_date: str,
@@ -319,6 +397,7 @@ def _pick_drafts(
     batch_size: int,
     item_code: str,
     warehouse: str,
+    min_age_minutes: int = 0,
 ) -> list[str]:
     """Pick draft DN names matching the drain filters, chronological order."""
     where_parts = [
@@ -329,6 +408,12 @@ def _pick_drafts(
     ]
     if customer:
         where_parts.append("dn.customer = %(customer)s")
+    if min_age_minutes > 0:
+        # Event 2: leave freshly punched DNs alone — only drain drafts that have
+        # sat for at least min_age_minutes since creation.
+        where_parts.append(
+            "dn.creation <= DATE_SUB(NOW(), INTERVAL %(min_age_minutes)s MINUTE)"
+        )
 
     limit = f"LIMIT {int(batch_size)}" if batch_size and batch_size > 0 else ""
 
@@ -347,5 +432,6 @@ def _pick_drafts(
             "from_date": from_date,
             "to_date": to_date,
             "customer": customer or "",
+            "min_age_minutes": min_age_minutes,
         },
     )
