@@ -31,6 +31,20 @@ Usage (Administrator/System Manager):
   curl -s -X POST "$BASE/api/method/fuelbuddy_dubai.api.dn_cancel.cancel_async" \\
     -H "Authorization: token $KEY:$SECRET" \\
     --data-urlencode "names@names.txt" --data "dry_run=0"
+
+Bench console (use cancel_batch directly -- cancel_async would only enqueue):
+  bench --site <site> console
+
+  # 1. load the DN names: whitespace/comma separated string or a python list,
+  #    returns (FB/RTN/...) FIRST, then originals
+  names = open("/tmp/names.txt").read()
+
+  # 2. dry run: validates + reports counts, cancels nothing
+  from fuelbuddy_dubai.api.dn_cancel import cancel_batch
+  cancel_batch(names=names, dry_run=1)
+
+  # 3. real run: commits per doc; re-run the same list to retry failures
+  cancel_batch(names=names, dry_run=0)
 """
 
 from __future__ import annotations
