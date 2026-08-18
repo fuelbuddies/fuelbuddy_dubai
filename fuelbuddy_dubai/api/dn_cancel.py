@@ -35,9 +35,13 @@ Usage (Administrator/System Manager):
 Bench console (use cancel_batch directly -- cancel_async would only enqueue):
   bench --site <site> console
 
-  # 1. load the DN names: whitespace/comma separated string or a python list,
-  #    returns (FB/RTN/...) FIRST, then originals
-  names = open("/tmp/names.txt").read()
+  # 1. paste the DN names inline as a python LIST (not a set -- {} loses the
+  #    ordering, and returns (FB/RTN/...) must come FIRST, then originals)
+  names = [
+      "FB/RTN/26-27/JUN-00001",
+      "FB/RTN/26-27/JUN-00002",
+      "FB/DN/26-27/JUN-00001",
+  ]
 
   # 2. dry run: validates + reports counts, cancels nothing
   from fuelbuddy_dubai.api.dn_cancel import cancel_batch
