@@ -122,13 +122,13 @@ app_license = "mit"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+# Warehouse capacity (IDEV-3119), ported from the desk Server Scripts "Capacity on Purchase Receipt"
+# and "Capacity for Stock entry" (Before Save -> validate). Switch those scripts off on deploy.
+_CAPACITY = "fuelbuddy_dubai.warehouse_capacity"
+doc_events = {
+	"Purchase Receipt": {"validate": f"{_CAPACITY}.validate_purchase_receipt"},
+	"Stock Entry": {"validate": f"{_CAPACITY}.validate_stock_entry"},
+}
 
 # Scheduled Tasks
 # ---------------
