@@ -7,7 +7,7 @@ The reconciler (IDEV-3549) compares ERP's Stock Ledger Entries in each tank ware
 app's own ledger at ERP's 9 decimal places. `ledger` gives it, in one read:
 
 - the Stock Ledger Entries of one item in the given warehouses, modified at or after
-  `modified_since`, each with the keys of the voucher behind it;
+  `modified_since` and posted at or after `posted_since`, each with the keys of the voucher behind it;
 - each warehouse's Bin balance;
 - whether each warehouse is busy, meaning ERP's figures for it may still change.
 
@@ -23,6 +23,11 @@ balances ignore is_cancelled = 1 entries.
 
 `modified_since` is inclusive (>=): entries that share the cursor's timestamp come back again rather
 than being skipped. `name` identifies an entry across reads.
+
+`posted_since` is inclusive (>=) too, on `posting_datetime`: the reconciler reads only from the
+release cut-over on. Both bounds apply together when both are given.
+
+Access: whoever may read Stock Ledger Entry, as ERP's own permissions grant it.
 
 What `modified` does not show: a back-dated posting shifts qty_after_transaction on every later
 entry without touching their `modified` (erpnext stock_ledger.update_qty_in_future_sle). The Repost
@@ -66,7 +71,7 @@ VOUCHER_FIELDS = {
 
 
 @frappe.whitelist()
-def ledger(warehouses, item: str, modified_since: str | None = None) -> dict:
+def ledger(warehouses, item: str, modified_since: str | None = None, posted_since: str | None = None) -> dict:
 	"""Stock Ledger Entries, Bin balances and busy flags of `item` in the tank `warehouses`.
 
 	Args:
@@ -74,17 +79,20 @@ def ledger(warehouses, item: str, modified_since: str | None = None) -> dict:
 	    item: the item code.
 	    modified_since: only entries whose `modified` is at or after this ERP-local timestamp, as
 	        an entry's `modified` gives it. Empty returns every entry.
+	    posted_since: only entries whose `posting_datetime` is at or after this ERP-local
+	        timestamp, in the same format. Empty applies no posting bound.
 
 	Returns:
 	    {"item", "entries": [...], "warehouses": [{"warehouse", "bin_actual_qty", "repost_pending",
 	    "pending_reposts", "drain_active", "busy"}]}, warehouses in the order given.
 	"""
-	frappe.only_for("System Manager")
+	frappe.has_permission("Stock Ledger Entry", "read", throw=True)
 	warehouses = _parse_warehouses(warehouses)
 	_validate(item, warehouses)
-	since = _parse_since(modified_since)
+	since = _parse_since(modified_since, "modified_since", "`modified`")
+	posted = _parse_since(posted_since, "posted_since", "`posting_datetime`")
 
-	entries = _entries(item, warehouses, since)
+	entries = _entries(item, warehouses, since, posted)
 	bins = _bin_actual_qty(item, warehouses)
 	pending = _pending_reposts(item, warehouses)
 	drain_active = bool(shadow_bin._raw_redis().exists(shadow_bin.RUN_KEY))
@@ -137,16 +145,16 @@ def _validate(item: str, warehouses: list[str]) -> None:
 		frappe.throw(_("Group warehouse(s) hold no stock entries: {0}").format(", ".join(groups)))
 
 
-def _parse_since(modified_since):
-	if not modified_since:
+def _parse_since(value, arg: str, column: str):
+	if not value:
 		return None
 	try:
-		since = get_datetime(modified_since)
+		since = get_datetime(value)
 	except Exception:
 		since = None
 	if since is None or since.tzinfo is not None:
 		frappe.throw(
-			_("modified_since must be an ERP-local timestamp without a time zone, as `modified` gives it")
+			_("{0} must be an ERP-local timestamp without a time zone, as {1} gives it").format(arg, column)
 		)
 	return since
 
@@ -174,9 +182,10 @@ def _voucher_columns() -> tuple[list[str], list[str]]:
 	return columns, joins
 
 
-def _entries(item: str, warehouses: list[str], since) -> list[dict]:
+def _entries(item: str, warehouses: list[str], since, posted) -> list[dict]:
 	columns, joins = _voucher_columns()
 	modified = "AND sle.modified >= %(since)s" if since else ""
+	posting = "AND sle.posting_datetime >= %(posted)s" if posted else ""
 	return frappe.db.sql(
 		f"""
 		SELECT
@@ -197,9 +206,10 @@ def _entries(item: str, warehouses: list[str], since) -> list[dict]:
 		WHERE sle.item_code = %(item)s
 			AND sle.warehouse IN %(warehouses)s
 			{modified}
+			{posting}
 		ORDER BY sle.warehouse, sle.posting_datetime, sle.creation, sle.name
 		""",
-		{"item": item, "warehouses": tuple(warehouses), "since": since},
+		{"item": item, "warehouses": tuple(warehouses), "since": since, "posted": posted},
 		as_dict=True,
 	)
 

@@ -239,6 +239,58 @@ class TestModifiedSince(TankStockCase):
 			self._ledger(modified_since="not a timestamp")
 
 
+class TestPostedSince(TankStockCase):
+	def setUp(self):
+		super().setUp()
+		self.p1 = self._sle(self.tank_a, "1.000000000", posting="2026-11-20 08:59:59.999999")
+		self.p2 = self._sle(self.tank_a, "2.000000000", posting="2026-11-20 09:00:00.000000")
+		self.p3 = self._sle(
+			self.tank_b,
+			"3.000000000",
+			posting="2026-11-21 00:00:00.000000",
+			modified="2026-11-19 10:00:00.000000",
+		)
+
+	def _names(self, **kw):
+		return {e["name"] for e in self._ledger(**kw)["entries"]}
+
+	def test_no_bound_returns_everything(self):
+		self.assertEqual(self._names(posted_since=None), {self.p1, self.p2, self.p3})
+		self.assertEqual(self._names(posted_since=""), {self.p1, self.p2, self.p3})
+
+	def test_bound_is_inclusive_to_the_microsecond(self):
+		self.assertEqual(self._names(posted_since="2026-11-20 09:00:00.000000"), {self.p2, self.p3})
+
+	def test_bound_after_everything_returns_nothing(self):
+		self.assertEqual(self._names(posted_since="2026-11-21 00:00:00.000001"), set())
+
+	def test_filters_on_posting_not_modified(self):
+		# p3 was modified before the bound but posted after it; p1 and p2 the other way round.
+		self.assertEqual(self._names(posted_since="2026-11-20 12:00:00"), {self.p3})
+
+	def test_applies_together_with_modified_since(self):
+		self.assertEqual(
+			self._names(posted_since="2026-11-20 09:00:00", modified_since="2026-11-20 00:00:00"), {self.p2}
+		)
+
+	def test_filtered_in_sql(self):
+		queries, real_sql = [], frappe.db.sql
+
+		def spy(query, values=(), *args, **kwargs):
+			queries.append((str(query), values))
+			return real_sql(query, values, *args, **kwargs)
+
+		with patch.object(frappe.local.db, "sql", side_effect=spy):
+			self._ledger(posted_since="2026-11-20 09:00:00")
+		(values,) = [v for q, v in queries if "sle.posting_datetime >= %(posted)s" in q]
+		self.assertEqual(str(values["posted"]), "2026-11-20 09:00:00")
+
+	def test_bound_with_a_time_zone_or_garbage_is_refused(self):
+		for bad in ("2026-11-20T10:00:00+00:00", "not a timestamp"):
+			with self.subTest(bad=bad), self.assertRaisesRegex(frappe.ValidationError, "posted_since"):
+				self._ledger(posted_since=bad)
+
+
 class TestVoucherFields(TankStockCase):
 	def _voucher(self, doctype, name, **fields):
 		row = {"name": name, "docstatus": 1}
@@ -386,16 +438,44 @@ class TestReadOnlyAndAccess(TankStockCase):
 		self.assertEqual(frappe.db.transaction_writes, writes_before)
 		self.assertEqual([c[0] for c in redis.method_calls], ["exists"])
 
-	def test_system_manager_only(self):
-		in_test = frappe.flags.in_test
-		frappe.flags.in_test = False  # frappe.only_for lets every test through
-		try:
-			frappe.set_user("Guest")
-			with self.assertRaises(frappe.PermissionError):
-				self._ledger()
-		finally:
-			frappe.set_user("Administrator")
-			frappe.flags.in_test = in_test
+	def _as(self, user):
+		frappe.set_user(user)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def _user(self, roles):
+		email = f"_t-tsl-{frappe.generate_hash(length=8).lower()}@example.com"
+		user = frappe.get_doc(
+			{"doctype": "User", "email": email, "first_name": "TSL", "send_welcome_email": 0}
+		).insert(ignore_permissions=True)
+		user.add_roles(*roles)
+		return email
+
+	def test_a_user_who_may_read_stock_ledger_entries_is_let_in(self):
+		readers = sorted(
+			p.role
+			for p in frappe.get_meta("Stock Ledger Entry").permissions
+			if p.read
+			and not p.permlevel
+			and not p.if_owner
+			and p.role not in ("Administrator", "System Manager")
+		)
+		if not readers:
+			self.skipTest("no role but System Manager reads Stock Ledger Entry on this site")
+		self._sle(self.tank_a, "1.000000000")
+		self._as(self._user([readers[0]]))
+		self.assertTrue(frappe.has_permission("Stock Ledger Entry", "read"))
+		self.assertEqual(len(self._ledger()["entries"]), 1)
+
+	def test_a_user_who_may_not_read_stock_ledger_entries_is_refused(self):
+		self._as(self._user([]))
+		self.assertFalse(frappe.has_permission("Stock Ledger Entry", "read"))
+		with self.assertRaises(frappe.PermissionError):
+			self._ledger()
+
+	def test_guest_is_refused(self):
+		self._as("Guest")
+		with self.assertRaises(frappe.PermissionError):
+			self._ledger()
 
 	def test_warehouses_as_json_or_a_single_name(self):
 		self._sle(self.tank_a, "1.000000000")
