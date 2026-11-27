@@ -408,6 +408,11 @@ def _pick_drafts(
     ]
     if customer:
         where_parts.append("dn.customer = %(customer)s")
+    if frappe.db.has_column("Delivery Note", "custom_app_lane_owned"):
+        # Leave the stock lane's drafts alone: the lane submits them itself, one at a
+        # time in fill-time order. The column comes with fuelbuddy_crm; until it exists
+        # no note is lane-owned.
+        where_parts.append("IFNULL(dn.custom_app_lane_owned, 0) = 0")
     if min_age_minutes > 0:
         # Event 2: leave freshly punched DNs alone — only drain drafts that have
         # sat for at least min_age_minutes since creation.
